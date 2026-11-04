@@ -1,0 +1,16 @@
+config.toml
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db*
+*.log
+__pycache__/
+*.pyc
+.venv/
+data/
+backups/
+transcripts/
+*.mp3
+*.m4a
+*.wav

@@ -1,0 +1,87 @@
+{
+  "schema_version": 2,
+  "required_capabilities": [
+    "declarative_basic"
+  ],
+  "workspace_title": "B站话题",
+  "pages": [
+    {
+      "id": "overview",
+      "title": "话题状态",
+      "placement": "workspace",
+      "icon": "puzzle",
+      "mode": "declarative",
+      "description": "仅公开标题和简介；不代表看过视频。",
+      "poll_interval_seconds": 0,
+      "queries": {
+        "runtime": {
+          "api": "status",
+          "version": "1"
+        }
+      },
+      "content": [
+        {
+          "type": "grid",
+          "label": "采集状态",
+          "columns": 3,
+          "children": [
+            {
+              "type": "stat",
+              "label": "已就绪",
+              "value": {
+                "scope": "query",
+                "source": "runtime",
+                "field": "ready"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "最近结果",
+              "value": {
+                "scope": "query",
+                "source": "runtime",
+                "field": "last_result"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "候选数量",
+              "value": {
+                "scope": "query",
+                "source": "runtime",
+                "field": "count"
+              }
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "label": "最近候选话题",
+          "value": {
+            "scope": "query",
+            "source": "runtime",
+            "field": "topics"
+          },
+          "columns": [
+            {
+              "field": "title",
+              "label": "标题"
+            },
+            {
+              "field": "category",
+              "label": "分区"
+            },
+            {
+              "field": "url",
+              "label": "原视频"
+            },
+            {
+              "field": "evidence",
+              "label": "资料范围"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

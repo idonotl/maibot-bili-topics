@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "id": "local.bili-topics",
+  "version": "0.4.1",
+  "name": "B站话题 · 麦麦适配版",
+  "description": "B站话题插件：定时采集公开热门并生成弹幕摘要，供主动搭话使用；提供按链接看视频、按关键词搜索、汇报热点三个工具，并支持本地语音转写（下载音频→whisper→用完即删）。",
+  "author": {
+    "name": "idonotl",
+    "url": "https://github.com/idonotl"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/idonotl/maibot-bili-topics",
+    "homepage": "https://github.com/idonotl/maibot-bili-topics",
+    "documentation": "https://github.com/idonotl/maibot-bili-topics/blob/main/README.md",
+    "issues": "https://github.com/idonotl/maibot-bili-topics/issues"
+  },
+  "host_application": {
+    "min_version": "1.3.15",
+    "max_version": "1.3.19"
+  },
+  "sdk": {
+    "min_version": "2.16.0",
+    "max_version": "2.99.99"
+  },
+  "plugin_type": "integration",
+  "dependencies": [],
+  "capabilities": [
+    "llm.generate"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
