@@ -10,6 +10,7 @@ from .config import BiliConfig
 from .store import Store
 from .source import fetch
 from .danmaku import HEADERS, deep_read, probe, render_probe
+from . import frames as fr
 from . import transcript as asr
 from .search import Search, resolve_bvid
 
@@ -50,6 +51,7 @@ class BiliTopics(MaiBotPlugin):
     def __init__(self):
         super().__init__()
         self.store = None
+        self._cookies = {}
         self.worker = None
         self._deep_lock = asyncio.Lock()
         self._tool_lock = asyncio.Lock()
@@ -67,34 +69,44 @@ class BiliTopics(MaiBotPlugin):
         self._tasks = set()
         self._last_manual_browse = 0.0
         self._browse_session = {}
+        self._scene_tasks = {}
+        self._scene_sem = asyncio.Semaphore(1)
+        self._watch_queue: "asyncio.Queue" = asyncio.Queue(maxsize=32)
+        self._watch_worker = None
 
     # ---------- 生命周期 ----------
     async def on_load(self):
         if not self.config.plugin.enabled:
             return
         self.store = Store(self.ctx.paths.data_dir / 'topics.sqlite3')
+        self._cookies = self._load_cookies()
         await asyncio.to_thread(self.store.start)
         removed = await asyncio.to_thread(asr.remove_leftovers, self._temp_dir())
         if removed:
             self._get_logger().info("B站转写：启动时清理残留音频 %d 个", removed)
         self.worker = asyncio.create_task(self.run())
+        self._watch_worker = asyncio.create_task(self._watch_loop())
         self._browse = asyncio.create_task(self._browse_loop())
         if self.config.plugin.deep_read:
             self._prewarm = asyncio.create_task(self._prewarm_later())
 
     async def on_unload(self):
-        for task in (self.worker, self._prewarm, self._browse):
+        for task in (self.worker, self._prewarm, self._browse, self._watch_worker):
             if task:
                 task.cancel()
-        await asyncio.gather(*[t for t in (self.worker, self._prewarm, self._browse) if t], return_exceptions=True)
+        await asyncio.gather(*[t for t in (self.worker, self._prewarm, self._browse, self._watch_worker) if t],
+                             return_exceptions=True)
         self.worker = None
         self._prewarm = None
         self._browse = None
         self.store = None
         self._probe_cache.clear()
-        for task in list(self._tasks):
+        pending=set(self._tasks)|set(self._scene_tasks.values())
+        for task in pending:
             task.cancel()
+        await asyncio.gather(*pending,return_exceptions=True)
         self._tasks.clear()
+        self._scene_tasks.clear()
 
     async def on_config_update(self, scope, config_data, version):
         if scope in ('', 'self'):
@@ -127,6 +139,7 @@ class BiliTopics(MaiBotPlugin):
                 if time.time() - self._last_asr_cleanup > 6 * 3600:
                     self._last_asr_cleanup = time.time()
                     await asyncio.to_thread(asr.cleanup_temp, self._temp_dir())
+                    await asyncio.to_thread(self._cleanup_frames, 3600)
                     if self.store:
                         days = self.config.plugin.transcript_keep_days
                         await asyncio.to_thread(self.store.cleanup_transcripts, days)
@@ -204,6 +217,43 @@ class BiliTopics(MaiBotPlugin):
                 topic['transcript'] = row['text'][:500]
                 topic['transcript_chars'] = row.get('chars') or len(row['text'])
         return {'ok': True, 'topic': topic}
+
+
+    @API('learning_material', description='给表达学习插件提供素材：已缓存的转写、画面描述与元信息', version='1', public=True)
+    async def learning_material(self, bvid: str = ''):
+        """返回已缓存的素材；没有缓存时告诉调用方先去听/看。"""
+        code = (bvid or '').strip()
+        if not code or not self.store:
+            return {'ok': False, 'reason': 'no_store'}
+        material = {'bvid': code, 'title': '', 'description': '', 'duration': 0.0,
+                    'transcript': '', 'scenes': ''}
+        try:
+            timeout = httpx.Timeout(15.0, connect=8.0)
+            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                         follow_redirects=True, trust_env=False) as client:
+                video = await fetch_view_safe(client, code)
+            material['title'] = video.get('title') or ''
+            material['description'] = video.get('desc') or ''
+            material['duration'] = float(video.get('duration') or 0)
+        except Exception:
+            self._get_logger().debug('learning_material: 读取视频信息失败 %s', code)
+        row = await asyncio.to_thread(self.store.get_transcript, code)
+        if row and asr.usable(row.get('text', '')):
+            material['transcript'] = row['text']
+        scene = await asyncio.to_thread(self.store.get_scene, code)
+        if scene and asr.usable(scene['text']):
+            material['scenes'] = scene['text']
+        if scene:
+            raw_hints = scene['danmaku'] if 'danmaku' in scene.keys() else ''
+            if raw_hints:
+                try:
+                    hint_map = json.loads(raw_hints)
+                    material['danmaku'] = ["；".join(words) for words in list(hint_map.values())[:6]]
+                except (TypeError, ValueError):
+                    material['danmaku'] = []
+        if not material['transcript'] and not material['scenes']:
+            return {'ok': False, 'reason': 'no_material'}
+        return {'ok': True, 'material': material}
 
     @API('status', description='查看公开话题采集状态', version='1')
     async def status(self):
@@ -451,7 +501,8 @@ class BiliTopics(MaiBotPlugin):
             if len(picked_items) >= want:
                 break
             try:
-                async with httpx.AsyncClient(headers=HEADERS, timeout=httpx.Timeout(12.0, connect=6.0),
+                async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None,
+                                             timeout=httpx.Timeout(12.0, connect=6.0),
                                              follow_redirects=True, trust_env=False) as client:
                     video = await fetch_view_safe(client, choice["bvid"])
             except Exception:
@@ -477,6 +528,7 @@ class BiliTopics(MaiBotPlugin):
             self._track(asyncio.create_task(self._maybe_deep_read(
                 {"bvid": video["bvid"], "title": video["title"], "description": video["desc"],
                  "published": video["published"]}, ignore_cooldown=True)))
+            self._enqueue_watch(video, "user")
             self._get_logger().info("B站按指令浏览（one）：%s → %s", picked, video["title"][:40])
             return ("刷到一个：《%s》｜UP：%s｜时长 %s\n简介：%s\n"
                     "（可以直接讲给对方听；要细节我可以再听语音。）" % (
@@ -485,11 +537,13 @@ class BiliTopics(MaiBotPlugin):
 
         self._browse_session = {"started": now, "keyword": picked,
                                 "items": picked_items, "shared": 0}
+        for item in picked_items:
+            self._enqueue_watch(item, "browse")
         await asyncio.to_thread(self.store.finish_browse, now,
                                 "自由刷（session）：%s 收藏 %d 条" % (picked, len(picked_items)), [])
         self._get_logger().info("B站自由刷：%s 收藏 %d 条", picked, len(picked_items))
         return ("已经刷了一会儿，收藏了 %d 条有意思的（先不剧透）。"
-                "现在只需要轻轻回一句“好呀，那我刷会儿”这类话，不要讲具体视频内容；"
+                "这是浏览结果；回应语气与先后由当前对话决定，不需要重复答应去刷；先不讲具体视频内容，"
                 "等对方问你刷到什么、或说“分享一下”时，再调用 bili_share_session 讲。"
                 % len(picked_items))
 
@@ -523,8 +577,26 @@ class BiliTopics(MaiBotPlugin):
                 index, video["title"][:50], video["author"] or "未知",
                 asr_duration(video["duration"])))
             if video.get("desc"):
-                lines.append("   %s" % video["desc"][:80])
-        lines.append("（用自己的话讲，不要念标题，不要贴链接；想细聊哪条可以再用 bili_video_probe 看弹幕。）")
+                lines.append("   简介：%s" % video["desc"][:80])
+            transcript = None
+            scene = None
+            if self.store:
+                transcript = await asyncio.to_thread(self.store.get_transcript, video["bvid"])
+                scene = await asyncio.to_thread(self.store.get_scene, video["bvid"])
+            if transcript and asr.usable(transcript.get("text", "")):
+                lines.append("   我听到的：%s" % transcript["text"][:180].replace("\n", " "))
+            if scene and asr.usable(scene["text"]):
+                lines.append("   我看到的：%s" % scene["text"][:200].replace("\n", " "))
+            if scene and "danmaku" in scene.keys() and scene["danmaku"]:
+                try:
+                    hint_map = json.loads(scene["danmaku"])
+                    words = ["、".join(v) for v in list(hint_map.values())[:3]]
+                    if words:
+                        lines.append("   观众反应（帮我理解，不必逐条说）：%s" % "｜".join(words))
+                except (TypeError, ValueError):
+                    pass
+        lines.append("（用自己的话讲，不要念标题、不要贴链接；弹幕只当理解素材，"
+                     "不要固定说“弹幕都在刷什么”，觉得贴切可以顺口带一句；还没深看完的就按简介聊。）")
         return "\n".join(lines)
 
     @Tool(
@@ -545,6 +617,205 @@ class BiliTopics(MaiBotPlugin):
                     session.get("keyword", "随便看看"), minutes,
                     len(self._browse_session.get("items") or []) + session.get("shared", 0),
                     session.get("shared", 0)))
+
+
+    @Tool(
+        "bili_frames",
+        description=(
+            "看视频画面：按弹幕热度抽帧，再让视觉模型描述每一帧，得到按时间排序的画面内容。"
+            "想知道视频里画面发生了什么、角色在做什么、画面字幕写了什么时用。"
+            "第一次调用会启动后台处理（约 1-3 分钟），期间先回一句“我看看”；"
+            "之后再来问会直接返回结果。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="url_or_bvid",
+                param_type=ToolParamType.STRING,
+                description="视频链接或 BV 号。",
+                required=True,
+            ),
+        ],
+    )
+    async def bili_frames(self, url_or_bvid: str, **kwargs):
+        cfg = self.config.plugin
+        if not cfg.frames_enabled:
+            return "抽帧看画面现在是关的。"
+        bvid = await resolve_bvid(url_or_bvid)
+        if not bvid:
+            return "没能识别出 BV 号。"
+        if self.store:
+            cached = await asyncio.to_thread(self.store.get_scene, bvid)
+            if cached and asr.usable(cached["text"]):
+                return self._render_scene(cached, cached=True)
+        if bvid in self._scene_tasks and not self._scene_tasks[bvid].done():
+            return ("画面还在分析（大约 1-3 分钟）。先别调这个工具，"
+                    "可以正常回一句“我看看”，过一会儿再问。")
+        try:
+            timeout = httpx.Timeout(20.0, connect=10.0)
+            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                         follow_redirects=True, trust_env=False) as client:
+                video = await fetch_view_safe(client, bvid)
+        except Exception as exc:
+            return "读取视频信息失败：%s" % type(exc).__name__
+        duration = float(video.get("duration") or 0)
+        if duration <= 0:
+            return "这条视频时长信息异常。"
+        if duration > cfg.frames_max_minutes * 60:
+            return "视频太长（%.0f 分钟），先不抽帧。" % (duration / 60)
+        if bvid in self._scene_tasks and not self._scene_tasks[bvid].done():
+            return '画面正在分析，完成后再取结果。'
+        self._scene_tasks[bvid] = asyncio.create_task(self._scene_job(bvid, video))
+        self._track(self._scene_tasks[bvid])
+        self._get_logger().info("B站画面：开始分析 %s（%.0f 秒）", bvid, duration)
+        return ("已经开始看画面了（视频 %.0f 秒，抽 %d 帧）。大约 1-3 分钟能好，"
+                "现在先回一句自然的话，别等结果；过一会儿再问一次就能拿到具体画面内容。"
+                % (duration, cfg.frames_budget))
+
+    def _render_scene(self, row, cached=False):
+        """把画面分析结果整理成给模型读的时间轴。"""
+        hotspots = ""
+        try:
+            import json as _json
+            span = _json.loads(row["hotspots"] or "[]")
+            hotspots = "、".join("%.0f-%.0f 秒" % (a, b) for a, b in span[:4])
+        except Exception:
+            hotspots = ""
+        lines = [
+            "《%s》画面内容（共 %d 帧，%s）" % (
+                (row["bvid"] or "")[:0] or "", int(row["frames"] or 0),
+                "来自缓存" if cached else "刚分析完"),
+        ]
+        if hotspots:
+            lines.append("弹幕最热闹的段落：%s" % hotspots)
+        lines.append("")
+        lines.append(row["text"].strip())
+        lines.append("")
+        lines.append("（以上是画面里实际看到的内容，配合语音转写一起用时更完整；"
+                     "直接用自己的话讲，不要贴时间戳格式。）")
+        return "\n".join(lines)
+
+    async def _scene_job(self, bvid, video):
+        async with self._scene_sem:
+            return await self._scene_job_inner(bvid,video)
+
+    async def _scene_job_inner(self, bvid, video):
+        """后台任务：抽帧 → 视觉描述 → 写库 → 删临时文件。"""
+        cfg = self.config.plugin
+        out_dir = self._temp_dir() / "frames" / bvid
+        video_file = out_dir / "video.m4s"
+        try:
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                         follow_redirects=True, trust_env=False) as client:
+                xml = await client.get("https://comment.bilibili.com/%s.xml" % video["cid"])
+                entries = fr.parse_entries(xml.content)
+                times = [stamp for stamp, _ in entries]
+                groups, plan = fr.build_plan(
+                    times, float(video["duration"]),
+                    budget=min(fr.budget_for(float(video['duration'])),cfg.frames_budget)
+                    if cfg.frames_auto_budget else cfg.frames_budget)
+                url = await fr.fetch_track_url(client, bvid, video["cid"], max_height=cfg.frames_max_height)
+                if not url:
+                    self._get_logger().warning("B站画面 %s: 没有可用视频轨", bvid)
+                    return None
+                out_dir.mkdir(parents=True, exist_ok=True)
+                await fr.download(client, url, video_file)
+            try:
+                names = await asyncio.to_thread(fr.extract, video_file, plan, out_dir)
+            finally:
+                fr.cleanup([video_file])
+            if not names:
+                return None
+            items = [(float(name[1:-4]), out_dir / name) for name in names]
+            hints = fr.pick_highlights(entries, groups)
+            chunks = await fr.describe(self.ctx.llm.generate, items, batch=cfg.frames_batch, hints=hints)
+            text = "\n".join(chunks)
+            if not asr.usable(text):
+                self._get_logger().info("B站画面 %s: 描述为空", bvid)
+                return None
+            import json as _json
+            if self.store:
+                await asyncio.to_thread(self.store.save_scene, bvid, video["cid"],
+                                        float(video["duration"]), len(names), text,
+                                        _json.dumps(groups, ensure_ascii=False), time.time(),
+                                        _json.dumps(hints, ensure_ascii=False))
+            self._get_logger().info("B站画面完成 %s: %d 帧，%d 字", bvid, len(names), len(text))
+            return text
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._get_logger().exception("B站画面分析失败 %s", bvid)
+            return None
+        finally:
+            await asyncio.to_thread(fr.cleanup,[video_file])
+            await asyncio.to_thread(self._cleanup_frames, cfg.frames_keep_seconds)
+
+
+    # ---------- 深看队列 ----------
+    def _enqueue_watch(self, video: dict, source: str) -> None:
+        """把视频排进深看队列：先听，再看画面，最后交给学习插件判断要不要学。"""
+        if not self.config.plugin.browse_deep_watch:
+            return
+        if self._watch_queue.full():
+            self._get_logger().warning('B站深看队列已满，跳过 %s',video['bvid'])
+            return
+        self._watch_queue.put_nowait({
+            "bvid": video["bvid"], "title": video.get("title", ""),
+            "desc": video.get("desc", "") or "", "duration": float(video.get("duration") or 0),
+            "source": source,
+        })
+        self._get_logger().info("B站深看：入队 %s（%s）", video["bvid"], source)
+
+    async def _watch_loop(self):
+        """串行消费深看队列，避免 CPU 和带宽被同时打满。"""
+        while True:
+            try:
+                job = await self._watch_queue.get()
+                await self._deep_watch(job)
+                self._watch_queue.task_done()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._get_logger().exception("B站深看：任务异常")
+                await asyncio.sleep(2)
+
+    async def _deep_watch(self, job: dict):
+        """转写 → 画面描述 → 自动学习。每步失败都不影响后续流程。"""
+        bvid = job["bvid"]
+        cfg = self.config.plugin
+        if float(job.get('duration') or 0) > max(cfg.frames_max_minutes,cfg.transcript_max_minutes)*60:
+            return
+        try:
+            if cfg.transcript_enabled:
+                cached = await asyncio.to_thread(self.store.get_transcript, bvid)
+                if not (cached and asr.usable(cached.get("text", ""))):
+                    timeout = httpx.Timeout(20.0, connect=10.0)
+                    async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                                 follow_redirects=True, trust_env=False) as client:
+                        video = await fetch_view_safe(client, bvid)
+                    await self._transcribe_job(bvid, video)
+        except Exception:
+            self._get_logger().debug("B站深看：转写失败 %s", bvid, exc_info=True)
+        try:
+            if cfg.frames_enabled:
+                scene = await asyncio.to_thread(self.store.get_scene, bvid)
+                if not (scene and asr.usable(scene["text"])):
+                    timeout = httpx.Timeout(20.0, connect=10.0)
+                    async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                                 follow_redirects=True, trust_env=False) as client:
+                        video = await fetch_view_safe(client, bvid)
+                    await self.bili_frames(bvid)
+                    task=self._scene_tasks.get(bvid)
+                    if task:
+                        await asyncio.shield(task)
+        except Exception:
+            self._get_logger().debug("B站深看：画面失败 %s", bvid, exc_info=True)
+        try:
+            result = await self.ctx.api.call(
+                "local.whale-style.auto_learn", version="1", bvid=bvid, source=job.get("source", "browse"))
+            self._get_logger().info("B站深看完成 %s → 学习结果 %s", bvid, result)
+        except Exception:
+            self._get_logger().debug("B站深看：学习调用失败 %s", bvid, exc_info=True)
 
     # ---------- 主动浏览 ----------
     async def _browse_loop(self):
@@ -584,7 +855,8 @@ class BiliTopics(MaiBotPlugin):
             return
         choice = random.choice(usable_items[:3])
         try:
-            async with httpx.AsyncClient(headers=HEADERS, timeout=httpx.Timeout(15.0, connect=8.0),
+            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None,
+                                         timeout=httpx.Timeout(15.0, connect=8.0),
                                          follow_redirects=True, trust_env=False) as client:
                 video = await fetch_view_safe(client, choice["bvid"])
         except Exception:
@@ -613,6 +885,52 @@ class BiliTopics(MaiBotPlugin):
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
+
+
+    def _cookie_path(self):
+        from pathlib import Path
+        return Path(str(self.ctx.paths.data_dir)) / "bili-cookie.json"
+
+    def _load_cookies(self):
+        """读本地登录态；缺失或损坏时不带登录，不影响匿名可用。"""
+        import json
+        path = self._cookie_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self._get_logger().warning("B站登录态文件损坏，已按未登录处理")
+            return {}
+        cookies = data.get("cookies") or {}
+        if not cookies.get("SESSDATA"):
+            return {}
+        self._get_logger().info("B站登录态已加载（SESSDATA 有效期由 B站 控制）")
+        scoped = httpx.Cookies()
+        for key, value in cookies.items():
+            scoped.set(str(key), str(value), domain="api.bilibili.com", path="/")
+        for cookie in scoped.jar:
+            cookie.secure = True
+        return scoped
+
+    def _cleanup_frames(self, max_age_seconds: int) -> None:
+        """删掉过期的抽帧目录，避免图片堆积。"""
+        root = self._temp_dir() / "frames"
+        if not root.exists():
+            return
+        cutoff = time.time() - max_age_seconds
+        for path in root.rglob("*"):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+        for path in sorted(root.rglob("*"), reverse=True):
+            try:
+                if path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+            except OSError:
+                continue
 
     def _temp_dir(self):
         base = getattr(self.ctx.paths, "data_dir", None)
@@ -761,7 +1079,8 @@ class BiliTopics(MaiBotPlugin):
 
         try:
             timeout = httpx.Timeout(15.0, connect=8.0)
-            async with httpx.AsyncClient(headers=HEADERS, timeout=timeout, follow_redirects=True, trust_env=False) as client:
+            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                     follow_redirects=True, trust_env=False) as client:
                 video = await fetch_view_safe(client, bvid)
         except Exception as exc:
             return "读取视频信息失败：%s" % type(exc).__name__
@@ -801,7 +1120,8 @@ class BiliTopics(MaiBotPlugin):
             return "running"
         try:
             timeout = httpx.Timeout(15.0, connect=8.0)
-            async with httpx.AsyncClient(headers=HEADERS, timeout=timeout, follow_redirects=True, trust_env=False) as client:
+            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
+                                     follow_redirects=True, trust_env=False) as client:
                 video = await fetch_view_safe(client, bvid)
         except Exception:
             return "none"

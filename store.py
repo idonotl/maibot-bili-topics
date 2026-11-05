@@ -39,7 +39,9 @@ class Store:
               CREATE TABLE IF NOT EXISTS used(target TEXT,bvid TEXT,at REAL,PRIMARY KEY(target,bvid));
               CREATE TABLE IF NOT EXISTS deep_reads(at REAL NOT NULL,bvid TEXT NOT NULL,ok INTEGER NOT NULL,detail TEXT);
               CREATE TABLE IF NOT EXISTS browse_runs(at REAL NOT NULL, day TEXT NOT NULL, result TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS scenes(bvid TEXT PRIMARY KEY,cid INTEGER DEFAULT 0,duration REAL DEFAULT 0,frames INTEGER DEFAULT 0,text TEXT DEFAULT '',hotspots TEXT DEFAULT '',created_utc REAL NOT NULL,updated_utc REAL NOT NULL);
               CREATE TABLE IF NOT EXISTS transcripts(bvid TEXT PRIMARY KEY,cid INTEGER DEFAULT 0,model TEXT DEFAULT '',language TEXT DEFAULT '',duration REAL DEFAULT 0,text TEXT DEFAULT '',chars INTEGER DEFAULT 0,created_utc REAL NOT NULL,updated_utc REAL NOT NULL);""")
+            self._migrate_scenes()
             existing = {row[1] for row in db.execute("PRAGMA table_info(topics)")}
             for column, decl in EXTRA_COLUMNS.items():
                 if column not in existing:
@@ -170,6 +172,24 @@ class Store:
                 db.execute("DELETE FROM topics WHERE bvid=?", (row["bvid"],))
                 db.execute("DELETE FROM used WHERE bvid=?", (row["bvid"],))
         return items
+
+    def _migrate_scenes(self) -> None:
+        """给旧库补 danmaku 列。"""
+        with self.connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(scenes)")}
+            if "danmaku" not in columns:
+                db.execute("ALTER TABLE scenes ADD COLUMN danmaku TEXT DEFAULT ''")
+
+    def save_scene(self, bvid, cid, duration, frames, text, hotspots, now, danmaku=''):
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO scenes (bvid,cid,duration,frames,text,hotspots,danmaku,created_utc,updated_utc) '
+                       'VALUES (?,?,?,?,?,?,?,?,?)',
+                       (bvid, cid, duration, frames, text, hotspots, danmaku, now, now))
+
+    def get_scene(self, bvid, max_age_days=30):
+        with self.connect() as db:
+            return db.execute('SELECT * FROM scenes WHERE bvid=? AND updated_utc>=?',
+                              (bvid, __import__('time').time() - max_age_days * 86400)).fetchone()
 
     def get_transcript(self, bvid):
         with self.connect() as db:

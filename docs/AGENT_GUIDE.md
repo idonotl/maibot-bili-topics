@@ -4,15 +4,24 @@
 
 先阅读 README、`_manifest.json`、`config.example.toml` 和配置参考。确认宿主版本、Python 环境、实际插件目录、数据目录和模型配置。不要收集或输出密钥，不从使用者原配置复制令牌进 Git。
 
-本地旧版本经历过开发测试；本次公开副本经过默认值和隐私调整，测试结果以仓库发布记录为准。不要把版本范围理解为全平台实测。
+本指南对应 0.6.0。先核对实际部署的宿主版本和已启用的配置。
 
 ## 2. 本插件做什么
 
-公开热门、搜索、简介和弹幕素材，以及可选本地 faster-whisper 音频转写。
+公开素材、可选语音转写、关键帧分析与后台深看。
 
-配置授权会话及模型别名。先关闭转写和自动浏览，验证基本查询；如需转写，另行安装 faster-whisper 并配置本地模型目录。
+先验证授权会话和基础工具，再逐项开启深看功能。
 
 管理员、私聊和群名单默认不含任何真实用户。配置类要求非空机器人号时，必须填部署者自己的机器人号后才能加载。启用状态和 dry_run/shadow_mode 是独立概念：前者控制启动，后者控制是否实际生效或提交任务。
+
+### 视频资料与深看
+
+- 基础工具包括 `bili_video_probe`、`bili_search`、`bili_trending`。标题、简介和弹幕分别提供元信息及观众反应。
+- `bili_transcript` 将有权访问的音轨交给本地 faster-whisper。安装 `requirements-transcript.txt` 后提供 CTranslate2 格式的模型目录，设置 `transcript_model_dir` 与 `transcript_enabled=true`。CPU 可使用 `int8`；模型文件单独准备。
+- `bili_frames` 按时长和弹幕热点取样，PyAV 解码，Pillow 压缩，宿主模型生成画面描述。设 `frames_enabled=true`，确认宿主 `utils` 模型能接收图片输入。截图只反映抽样时刻，弹幕不能作为画面事实。
+- `browse_enabled=true` 后可启用 `browse_deep_watch`，后台按开关完成转写与抽帧。同一视频可以复用缓存。表达学习通过可选的 `local.whale-style.auto_learn` 联动；独立安装这个仓库即可使用视频功能。
+- 若匿名无法获取部分媒体轨，可按自己的访问权限使用本地 SDK 数据目录中的 `bili-cookie.json`，结构为 `{"cookies": {"SESSDATA": "<本地值>"}}`。公开版本只将 Cookie 发往 B 站 API 的 HTTPS 请求。切勿提交真实文件。
+- `local.bili-topics.pick_topic` 可供主动搭话使用，`local.bili-topics.learning_material` 可供表达学习取缓存。两者都不会直接发送 QQ 消息。
 
 ## 3. 数据与边界
 

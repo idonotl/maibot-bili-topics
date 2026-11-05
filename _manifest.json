@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.bili-topics",
-  "version": "0.4.1",
+  "version": "0.6.0",
   "name": "B站话题 · 麦麦适配版",
-  "description": "B站话题插件：定时采集公开热门并生成弹幕摘要，供主动搭话使用；提供按链接看视频、按关键词搜索、汇报热点三个工具，并支持本地语音转写（下载音频→whisper→用完即删）。",
+  "description": "B站公开话题、弹幕、可选语音转写、关键帧视觉描述与后台深看。",
   "author": {
     "name": "idonotl",
     "url": "https://github.com/idonotl"
@@ -26,7 +26,8 @@
   "plugin_type": "integration",
   "dependencies": [],
   "capabilities": [
-    "llm.generate"
+    "llm.generate",
+    "api.call"
   ],
   "i18n": {
     "default_locale": "zh-CN",

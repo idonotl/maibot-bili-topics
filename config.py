@@ -2,7 +2,7 @@ from maibot_sdk import Field, PluginConfigBase
 
 class Settings(PluginConfigBase):
     __ui_label__ = "B站话题设置"
-    enabled: bool = Field(default=False, description="只读取公开热门资料，不登录、不互动")
+    enabled: bool = Field(default=False, description="读取公开内容，可用本地登录态取得视频轨；不发布或互动")
     config_version: str = Field(default="0.2.0")
     interval_minutes: int = Field(default=180, ge=180, le=1440, description="采集间隔，至少180分钟")
     daily_max: int = Field(default=3, ge=1, le=3, description="每天最多采集次数，失败也计入")
@@ -19,6 +19,14 @@ class Settings(PluginConfigBase):
     summary_max_tokens: int = Field(default=600, ge=200, le=1500, description="摘要生成的最大输出 token")
     tool_sample: int = Field(default=50, ge=10, le=120, description="工具读取视频时取样多少条弹幕")
     tool_max_duration: int = Field(default=14400, ge=300, le=28800, description="工具按需读取时允许的视频最长时长（秒），默认4小时")
+    browse_deep_watch: bool = Field(default=False, description="刷B站时逐条深看（转写+画面）")
+    frames_enabled: bool = Field(default=False, description="允许按弹幕热度抽帧看画面")
+    frames_auto_budget: bool = Field(default=True, description="按时长自动决定抽帧数")
+    frames_budget: int = Field(default=12, ge=4, le=32, description="每次抽帧上限")
+    frames_max_height: int = Field(default=816, ge=360, le=1080, description="抽帧视频轨的最高分辨率")
+    frames_batch: int = Field(default=4, ge=1, le=8, description="每次视觉请求送几张图")
+    frames_max_minutes: int = Field(default=20, ge=1, le=120, description="超过这个时长不抽帧")
+    frames_keep_seconds: int = Field(default=3600, ge=60, description="抽帧图片保留秒数，过期自动删")
     browse_enabled: bool = Field(default=False, description="允许她主动去 B站 搜/刷感兴趣的内容当谈资")
     browse_interval_minutes: int = Field(default=240, ge=30, le=1440, description="两次主动浏览的最小间隔（分钟）")
     browse_daily_max: int = Field(default=3, ge=0, le=12, description="每天最多主动浏览几次")
