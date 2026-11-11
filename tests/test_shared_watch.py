@@ -13,7 +13,10 @@ import sys
 import time
 import unittest
 
-import av
+try:
+    import av  # 可选转写依赖，仅一条用真实视频验证时长取整
+except ModuleNotFoundError:
+    av = None
 import httpx
 
 PACKAGE = ModuleType("test_shared_bili")
@@ -38,6 +41,7 @@ def observation():
 
 
 class MediaTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipIf(av is None, "需要 PyAV 才能生成真实短视频")
     def test_whole_second_duration_accepts_real_tail_but_not_short_track(self):
         with TemporaryDirectory() as folder:
             out = Path(folder)
@@ -342,7 +346,8 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.messages = FakeMessages()
         owner = SimpleNamespace(
-            config=SimpleNamespace(plugin=Settings(private_user_ids=["author"], group_ids=["group"])),
+            # 开关显式打开：公开仓库导出的默认值一律关闭，依赖本机默认值的测试在发布树里会整片失败。
+            config=SimpleNamespace(plugin=Settings(share_watch_enabled=True, private_user_ids=["author"], group_ids=["group"])),
             store=object(), ctx=SimpleNamespace(message=self.messages),
             _get_logger=lambda: logging.getLogger("test-watch"),
         )

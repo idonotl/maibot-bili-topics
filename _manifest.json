@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "local.bili-topics",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "name": "B站话题 · 麦麦适配版",
   "description": "处理用户分享的 B站视频：先联合理解完整音轨和分段画面，再按人设回应；保留公开搜索、主动浏览与表达学习素材功能。",
   "author": {
