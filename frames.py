@@ -28,7 +28,7 @@ HEADERS: Dict[str, str] = {
 
 MAX_SIDE = 1280
 # 视觉描述单次 RPC 上限：宿主硬超时 90 秒，留出协商余量
-MATCH_RPC_TIMEOUT_MS = 240000
+FRAME_RPC_TIMEOUT_MS = 380_000
 
 
 def parse_times(xml_bytes: bytes) -> List[float]:
@@ -231,26 +231,48 @@ async def download(client: httpx.AsyncClient, url: str, dest: pathlib.Path) -> N
                 handle.write(chunk)
 
 
-def extract(video_path: pathlib.Path, timestamps: Sequence[float], out_dir: pathlib.Path) -> List[str]:
+def extract(
+    video_path: pathlib.Path,
+    timestamps: Sequence[float],
+    out_dir: pathlib.Path,
+    *,
+    declared_duration: Optional[float] = None,
+) -> List[str]:
     """按时间点抽帧，返回落盘文件名列表。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     container = av.open(str(video_path))
     stream = container.streams.video[0]
     saved: List[str] = []
     try:
-        for stamp in timestamps:
+        for index, stamp in enumerate(timestamps):
             container.seek(int(stamp * av.time_base), backward=True)
+            selected = last_frame = None
             for frame in container.decode(stream):
-                if frame.time is None or frame.time < stamp - 0.3:
+                if frame.time is None:
                     continue
-                image = frame.to_image()
-                if image.width > MAX_SIDE:
-                    ratio = MAX_SIDE / image.width
-                    image = image.resize((MAX_SIDE, int(image.height * ratio)))
-                name = "t%06.1f.jpg" % stamp
-                image.save(out_dir / name, quality=88)
-                saved.append(name)
-                break
+                if frame.time >= stamp - 0.3:
+                    selected = frame
+                    break
+                last_frame = frame
+            # B站 reports whole seconds. At EOF the last frame can be just
+            # before the sampling window, even though the track is complete.
+            if (selected is None and last_frame is not None
+                    and index == len(timestamps) - 1 and declared_duration is not None
+                    and stream.duration is not None and stream.time_base is not None):
+                track_end = float(((stream.start_time or 0) + stream.duration) * stream.time_base)
+                if (0 <= declared_duration - track_end <= 1.0
+                        and 0 <= track_end - last_frame.time <= 0.3
+                        and 0 <= stamp - last_frame.time <= 0.6):
+                    selected = last_frame
+            if selected is None:
+                continue
+            image = selected.to_image()
+            if image.width > MAX_SIDE:
+                ratio = MAX_SIDE / image.width
+                image = image.resize((MAX_SIDE, int(image.height * ratio)))
+            name = "t%06.1f.jpg" % stamp
+            image.save(out_dir / name, quality=88)
+            saved.append(name)
     finally:
         container.close()
     return saved
@@ -309,12 +331,13 @@ async def describe(generate, items: Sequence[Tuple[float, pathlib.Path]], batch:
                 "type": "image_url",
                 "image_url": {"url": "data:image/jpeg;base64," + encode_frame(path)},
             })
-        # 视觉请求实测单批 60-70 秒，必须显式放宽 RPC 超时（SDK 默认 30 秒会先失败）
+        # RPC 等待覆盖视觉任务的候选模型切换。
         response = await generate(
             [{"role": "user", "content": parts}],
+            task_name="vlm",
             temperature=0.2,
             max_tokens=2000,
-            rpc_timeout_ms=MATCH_RPC_TIMEOUT_MS,
+            rpc_timeout_ms=FRAME_RPC_TIMEOUT_MS,
         )
         if isinstance(response,dict) and response.get('success') is False:
             raise RuntimeError('visual_generation_failed')

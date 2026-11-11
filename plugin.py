@@ -3,17 +3,20 @@ from pathlib import Path
 import httpx
 from collections import deque
 
-from maibot_sdk import API, MaiBotPlugin, Tool
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from maibot_sdk import API, HookHandler, MaiBotPlugin, Tool
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .config import BiliConfig
 from .store import Store
 from .source import fetch
-from .danmaku import HEADERS, deep_read, probe, render_probe
+from .danmaku import HEADERS, SUMMARY_RPC_TIMEOUT_SECONDS, deep_read, probe, render_probe
 from . import frames as fr
+from .media_watch import FUSION_WAIT_SECONDS
 from . import transcript as asr
 from .search import Search, resolve_bvid
+from .watch_chat import SharedWatch
 
+SHARED_WATCH_HOOK_TIMEOUT_MS = (1225 + FUSION_WAIT_SECONDS) * 1000
 
 
 def asr_duration(seconds) -> str:
@@ -73,6 +76,7 @@ class BiliTopics(MaiBotPlugin):
         self._scene_sem = asyncio.Semaphore(1)
         self._watch_queue: "asyncio.Queue" = asyncio.Queue(maxsize=32)
         self._watch_worker = None
+        self._shared_watch = SharedWatch(self)
 
     # ---------- 生命周期 ----------
     async def on_load(self):
@@ -91,6 +95,7 @@ class BiliTopics(MaiBotPlugin):
             self._prewarm = asyncio.create_task(self._prewarm_later())
 
     async def on_unload(self):
+        await self._shared_watch.close()
         for task in (self.worker, self._prewarm, self._browse, self._watch_worker):
             if task:
                 task.cancel()
@@ -112,6 +117,80 @@ class BiliTopics(MaiBotPlugin):
         if scope in ('', 'self'):
             await self.on_unload()
             await self.on_load()
+
+    # User-shared videos have a separate path from metadata lookups and the
+    # optional background browsing/learning queue.
+    @HookHandler(
+        "maisaka.planner.before_request", name="wait_for_shared_video",
+        description="在本轮视频分享的声画就绪前等待，不以预览替代内容。",
+        mode=HookMode.BLOCKING, order=HookOrder.EARLY,
+        timeout_ms=SHARED_WATCH_HOOK_TIMEOUT_MS, error_policy=ErrorPolicy.SKIP,
+    )
+    async def wait_for_shared_video(self, **kwargs):
+        return await self._shared_watch.planner(kwargs)
+
+    @HookHandler(
+        "maisaka.planner.after_response", name="route_finished_video_reply",
+        description="把本轮已处理的视频交给原生 reply，避免再次调用预览或错回旧视频。",
+        mode=HookMode.BLOCKING, order=HookOrder.LATE,
+        timeout_ms=3000, error_policy=ErrorPolicy.SKIP,
+    )
+    async def route_finished_video_reply(self, **kwargs):
+        return await self._shared_watch.route_planner_reply(kwargs)
+
+    @HookHandler(
+        "maisaka.replyer.before_request", name="react_to_shared_video",
+        description="逐条等待对应视频的声画资料，再交给原生回复器。",
+        mode=HookMode.BLOCKING, order=HookOrder.LATE,
+        timeout_ms=SHARED_WATCH_HOOK_TIMEOUT_MS, error_policy=ErrorPolicy.SKIP,
+    )
+    async def react_to_shared_video(self, **kwargs):
+        return await self._shared_watch.prepare_reply(kwargs)
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request", name="hide_shared_card_preview",
+        description="当前分享用声画资料，移除同一消息的封面预览。",
+        mode=HookMode.BLOCKING, order=HookOrder.LATE,
+        timeout_ms=1000, error_policy=ErrorPolicy.SKIP,
+    )
+    async def hide_shared_card_preview(self, **kwargs):
+        return self._shared_watch.replyer_items(kwargs)
+
+    @HookHandler(
+        "maisaka.replyer.after_response", name="retry_wrong_video_role",
+        description="用户已指明视频人物时，出现多余身份撇清则重生成一次。",
+        mode=HookMode.BLOCKING, order=HookOrder.LATE,
+        timeout_ms=1000, error_policy=ErrorPolicy.SKIP,
+    )
+    async def retry_wrong_video_role(self, **kwargs):
+        return self._shared_watch.retry_role_reply(kwargs)
+
+    @HookHandler(
+        "maisaka.reply.before_post_process", name="omit_redundant_role_disclaimer",
+        description="去掉与当轮明确人物归属冲突的撇清短句。",
+        mode=HookMode.BLOCKING, order=HookOrder.NORMAL,
+        timeout_ms=1000, error_policy=ErrorPolicy.SKIP,
+    )
+    async def omit_redundant_role_disclaimer(self, **kwargs):
+        return self._shared_watch.strip_role_disclaimer(kwargs)
+
+    @HookHandler(
+        "send_service.before_send", name="gate_unready_video_reply",
+        description="待看、换题或未经校验的失败回复不发送。",
+        mode=HookMode.BLOCKING, order=HookOrder.LATE,
+        timeout_ms=3000, error_policy=ErrorPolicy.SKIP,
+    )
+    async def gate_unready_video_reply(self, **kwargs):
+        return await self._shared_watch.before_send(kwargs)
+
+    @HookHandler(
+        "send_service.after_send", name="mark_video_reply_delivered",
+        description="记录本轮视频分享已成功回应，避免补发。",
+        mode=HookMode.OBSERVE, order=HookOrder.NORMAL,
+        timeout_ms=500, error_policy=ErrorPolicy.SKIP,
+    )
+    async def mark_video_reply_delivered(self, **kwargs):
+        self._shared_watch.after_send(kwargs)
 
     # ---------- 采集 ----------
     async def run(self):
@@ -172,7 +251,8 @@ class BiliTopics(MaiBotPlugin):
             started = time.time()
             try:
                 video, summary, rendered, count = await asyncio.wait_for(
-                    deep_read(topic['bvid'], cfg, self.ctx.llm.generate), timeout=150)
+                    deep_read(topic['bvid'], cfg, self.ctx.llm.generate),
+                    timeout=2 * SUMMARY_RPC_TIMEOUT_SECONDS + 45)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -296,9 +376,8 @@ class BiliTopics(MaiBotPlugin):
     @Tool(
         "bili_video_probe",
         description=(
-            "读取某个 B站视频的公开信息与弹幕样本，用来判断这个视频讲了什么、观众在聊什么。"
-            "当用户发来 B站链接、BV号、b23.tv 短链，或让你「去看一下这个视频」时调用。"
-            "只读公开数据：不登录、不下载视频、不看画面和声音，返回里会标明这一点。"
+            "查 B站视频的标题、简介和观众弹幕。只适合查公开资料，不读取画面或声音，"
+            "不能替代观看，也不能用来认定视频实际讲了什么。用户直接分享的视频由声画流程处理。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -317,14 +396,7 @@ class BiliTopics(MaiBotPlugin):
                 bvid = await resolve_bvid(url_or_bvid)
                 if not bvid:
                     return "没能从这个内容里识别出 BV 号，确认一下是 B站 的视频链接吗？"
-                text = await self._cached_probe(bvid, self.config.plugin.tool_sample)
-                state = await self._prewarm_transcript(bvid)
-                if state == "running":
-                    text += ("\n\n（语音正在后台转写，约 1 分钟后调用 bili_transcript 就能拿到「视频里讲了什么」。"
-                             "现在先别调它，先正常回话。）")
-                elif state == "cached":
-                    text += "\n\n（这条视频的语音已经转写好了，需要具体内容可以直接调用 bili_transcript。）"
-                return text
+                return await self._cached_probe(bvid, self.config.plugin.tool_sample)
             except Exception as exc:
                 return "读取这个视频失败了：%s %s" % (type(exc).__name__, str(exc)[:120])
 
@@ -449,8 +521,8 @@ class BiliTopics(MaiBotPlugin):
                     keypoints = []
             lines.append("%d. %s｜%s" % (index, (row.get("title") or "")[:50], summary))
             if keypoints:
-                lines.append("   我觉得有意思的点：%s" % "；".join(str(k)[:30] for k in keypoints[:3]))
-        lines.append("（聊的时候用自己的话讲，不要念标题，不要贴链接；这几条已经从池子里删掉了。）")
+                lines.append("   可聊细节：%s" % "；".join(str(k)[:30] for k in keypoints[:3]))
+        lines.append("（以上记录已从待分享池移除。内容仅作资料，是否展开和提供链接以当前请求为准。）")
         return "\n".join(lines)
 
     @Tool(
@@ -624,8 +696,7 @@ class BiliTopics(MaiBotPlugin):
         description=(
             "看视频画面：按弹幕热度抽帧，再让视觉模型描述每一帧，得到按时间排序的画面内容。"
             "想知道视频里画面发生了什么、角色在做什么、画面字幕写了什么时用。"
-            "第一次调用会启动后台处理（约 1-3 分钟），期间先回一句“我看看”；"
-            "之后再来问会直接返回结果。"
+            "第一次调用启动后台处理，未就绪只返回状态。此工具不等同于完成声画观看。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -648,8 +719,7 @@ class BiliTopics(MaiBotPlugin):
             if cached and asr.usable(cached["text"]):
                 return self._render_scene(cached, cached=True)
         if bvid in self._scene_tasks and not self._scene_tasks[bvid].done():
-            return ("画面还在分析（大约 1-3 分钟）。先别调这个工具，"
-                    "可以正常回一句“我看看”，过一会儿再问。")
+            return "画面还在后台分析，尚无可用观察结果。"
         try:
             timeout = httpx.Timeout(20.0, connect=10.0)
             async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
@@ -667,8 +737,8 @@ class BiliTopics(MaiBotPlugin):
         self._scene_tasks[bvid] = asyncio.create_task(self._scene_job(bvid, video))
         self._track(self._scene_tasks[bvid])
         self._get_logger().info("B站画面：开始分析 %s（%.0f 秒）", bvid, duration)
-        return ("已经开始看画面了（视频 %.0f 秒，抽 %d 帧）。大约 1-3 分钟能好，"
-                "现在先回一句自然的话，别等结果；过一会儿再问一次就能拿到具体画面内容。"
+        return ("画面分析任务已启动（视频 %.0f 秒，计划抽 %d 帧）。正在后台处理，当前尚无分析结果；"
+                "任务完成后再次调用此工具可取结果。此进度不代表已看完视频，也不要求立即回复或切换话题。"
                 % (duration, cfg.frames_budget))
 
     def _render_scene(self, row, cached=False):
@@ -906,12 +976,7 @@ class BiliTopics(MaiBotPlugin):
         if not cookies.get("SESSDATA"):
             return {}
         self._get_logger().info("B站登录态已加载（SESSDATA 有效期由 B站 控制）")
-        scoped = httpx.Cookies()
-        for key, value in cookies.items():
-            scoped.set(str(key), str(value), domain="api.bilibili.com", path="/")
-        for cookie in scoped.jar:
-            cookie.secure = True
-        return scoped
+        return {str(k): str(v) for k, v in cookies.items()}
 
     def _cleanup_frames(self, max_age_seconds: int) -> None:
         """删掉过期的抽帧目录，避免图片堆积。"""
@@ -1031,8 +1096,7 @@ class BiliTopics(MaiBotPlugin):
         ]
         quality = self._asr_quality(text, video.get("duration") or 0)
         if quality == "poor":
-            lines.append("⚠️ 转写内容很少且断续：这条视频很可能是歌曲、MV 或多人闲聊，"
-                         "不要据此编造具体内容，按弹幕和标题聊即可，可以直说「我听不太清」。")
+            lines.append("转写中可辨认的语句很少，不能凭标题或弹幕补齐音轨内容。")
         elif quality == "thin":
             lines.append("（转写只覆盖了部分语音，回答时不要补全没听到的细节。）")
         if note:
@@ -1098,39 +1162,12 @@ class BiliTopics(MaiBotPlugin):
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=cfg.transcript_inline_seconds)
         except asyncio.TimeoutError:
-            return ("语音还在转写（视频约 %d 分钟）。请在 60 秒后再次调用 bili_transcript，"
-                    "届时会直接返回内容；不要用 wait 工具原地等待。" % max(1, int(duration // 60)))
+            return ("语音还在转写（视频约 %d 分钟），目前没有可用文本。"
+                    % max(1, int(duration // 60)))
         if result is None:
-            return "这个视频没有识别到可用的人声（可能纯音乐或没人说话），我这边只能按弹幕和简介来判断。"
+            return "暂时没有取得可用的人声转写；不能用弹幕或简介当作音轨内容。"
         return self._asr_text(bvid, video, result.text)
 
-    async def _prewarm_transcript(self, bvid: str) -> str:
-        """探测视频时顺手后台转写，避免用户追问时等太久。
-
-        Returns:
-            str: ``cached`` 已有转写 / ``running`` 后台转写中 / ``none`` 不做转写。
-        """
-        cfg = self.config.plugin
-        if not cfg.transcript_enabled or not self.store:
-            return "none"
-        cached = await asyncio.to_thread(self.store.get_transcript, bvid)
-        if cached and asr.usable(cached.get("text", "")):
-            return "cached"
-        if bvid in self._asr_tasks and not self._asr_tasks[bvid].done():
-            return "running"
-        try:
-            timeout = httpx.Timeout(15.0, connect=8.0)
-            async with httpx.AsyncClient(headers=HEADERS, cookies=self._cookies or None, timeout=timeout,
-                                     follow_redirects=True, trust_env=False) as client:
-                video = await fetch_view_safe(client, bvid)
-        except Exception:
-            return "none"
-        if float(video.get("duration") or 0) > cfg.transcript_max_minutes * 60:
-            return "none"
-        self._asr_tasks[bvid] = asyncio.create_task(self._transcribe_job(bvid, video))
-        self._transcribe_tasks_cleanup()
-        self._get_logger().info("B站转写：已为 %s 预热（后台）", bvid)
-        return "running"
 
     def _transcribe_tasks_cleanup(self):
         for key in [k for k, task in self._asr_tasks.items() if task.done()]:

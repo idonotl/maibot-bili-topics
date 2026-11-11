@@ -20,6 +20,8 @@ DANMAKU_URL = "https://comment.bilibili.com/{cid}.xml"
 
 MAX_XML_BYTES = 8 * 1024 * 1024
 
+SUMMARY_RPC_TIMEOUT_SECONDS = 380
+
 
 
 SUMMARIZE_SYSTEM = """你是给聊天机器人整理视频资料的分析器。你只能依据给定的视频元信息和弹幕文本判断内容。
@@ -132,7 +134,7 @@ def sample(items, want):
 
 
 
-async def fetch_view(client, bvid):
+async def fetch_view(client, bvid, *, page=None):
 
     r = await client.get(VIEW_URL, params={"bvid": bvid})
 
@@ -148,9 +150,14 @@ async def fetch_view(client, bvid):
 
     pages = data.get("pages") or []
 
-    if pages and isinstance(pages[0], dict) and pages[0].get("cid"):
+    if page is not None and (page < 1 or page > max(1, len(pages))):
+        raise ValueError("video page does not exist")
 
-        cid = pages[0]["cid"]
+    part = pages[(page or 1) - 1] if pages else {}
+
+    if isinstance(part, dict) and part.get("cid"):
+
+        cid = part["cid"]
 
     if not cid:
 
@@ -170,7 +177,7 @@ async def fetch_view(client, bvid):
 
         "category": clean(data.get("tname"), 40),
 
-        "duration": float(data.get("duration") or 0),
+        "duration": float((part.get("duration") if page is not None else None) or data.get("duration") or 0),
 
         "author": clean(((data.get("owner") or {}).get("name")), 60),
 
@@ -340,15 +347,19 @@ async def deep_read(bvid, settings, generate):
 
         prompt=messages,
 
-        model_name=settings.summary_model,
+        task_name=settings.summary_task,
 
         temperature=0.2,
 
         max_tokens=settings.summary_max_tokens,
 
-        rpc_timeout_ms=120000,
+        rpc_timeout_ms=SUMMARY_RPC_TIMEOUT_SECONDS * 1000,
 
     )
+
+    if isinstance(result, dict) and result.get("success") is False:
+
+        raise RuntimeError("summary_generation_failed")
 
     try:
 
@@ -370,13 +381,13 @@ async def deep_read(bvid, settings, generate):
 
             prompt=messages_retry,
 
-            model_name=settings.summary_model,
+            task_name=settings.summary_task,
 
             temperature=0.0,
 
             max_tokens=min(1500, settings.summary_max_tokens + 400),
 
-            rpc_timeout_ms=120000,
+            rpc_timeout_ms=SUMMARY_RPC_TIMEOUT_SECONDS * 1000,
 
         )
 

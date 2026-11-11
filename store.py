@@ -37,8 +37,12 @@ class Store:
             db.executescript("""CREATE TABLE IF NOT EXISTS runs(at REAL NOT NULL, day TEXT NOT NULL, result TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS topics(bvid TEXT PRIMARY KEY,title TEXT,description TEXT,category TEXT,author TEXT,url TEXT,published REAL,fetched REAL);
               CREATE TABLE IF NOT EXISTS used(target TEXT,bvid TEXT,at REAL,PRIMARY KEY(target,bvid));
+              CREATE INDEX IF NOT EXISTS used_bvid ON used(bvid);
               CREATE TABLE IF NOT EXISTS deep_reads(at REAL NOT NULL,bvid TEXT NOT NULL,ok INTEGER NOT NULL,detail TEXT);
               CREATE TABLE IF NOT EXISTS browse_runs(at REAL NOT NULL, day TEXT NOT NULL, result TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS shared_watches(
+                bvid TEXT NOT NULL,cid INTEGER NOT NULL,revision INTEGER NOT NULL,
+                evidence TEXT NOT NULL,updated_utc REAL NOT NULL,PRIMARY KEY(bvid,cid));
               CREATE TABLE IF NOT EXISTS scenes(bvid TEXT PRIMARY KEY,cid INTEGER DEFAULT 0,duration REAL DEFAULT 0,frames INTEGER DEFAULT 0,text TEXT DEFAULT '',hotspots TEXT DEFAULT '',created_utc REAL NOT NULL,updated_utc REAL NOT NULL);
               CREATE TABLE IF NOT EXISTS transcripts(bvid TEXT PRIMARY KEY,cid INTEGER DEFAULT 0,model TEXT DEFAULT '',language TEXT DEFAULT '',duration REAL DEFAULT 0,text TEXT DEFAULT '',chars INTEGER DEFAULT 0,created_utc REAL NOT NULL,updated_utc REAL NOT NULL);""")
             self._migrate_scenes()
@@ -67,14 +71,16 @@ class Store:
                 db.execute('INSERT OR IGNORE INTO topics (bvid,title,description,category,author,url,published,fetched) VALUES (?,?,?,?,?,?,?,?)',
                            tuple(t[k] for k in ('bvid', 'title', 'description', 'category', 'author', 'url', 'published', 'fetched')))
             db.execute('DELETE FROM topics WHERE fetched<?', (now - 7 * 86400,))
-            db.execute('DELETE FROM used WHERE bvid NOT IN (SELECT bvid FROM topics)')
             db.execute('DELETE FROM deep_reads WHERE at<?', (now - 7 * 86400,))
 
     def pick(self, target, now):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM topics t WHERE fetched>=? AND NOT EXISTS (SELECT 1 FROM used u WHERE u.bvid=t.bvid AND u.target=?) ORDER BY fetched DESC, published DESC LIMIT 1',
-                             (now - 3 * 86400, target)).fetchone()
+            row = db.execute(
+                'SELECT * FROM topics t WHERE fetched>=? '
+                'AND NOT EXISTS (SELECT 1 FROM used u WHERE u.bvid=t.bvid) '
+                'ORDER BY fetched DESC, published DESC LIMIT 1', (now - 3 * 86400,),
+            ).fetchone()
             if row is None:
                 return None
             db.execute('INSERT INTO used VALUES (?,?,?)', (target, row['bvid'], now))
@@ -164,13 +170,15 @@ class Store:
     def consume_topics(self, limit=3):
         """取出积攒的话题并从池子里删掉，避免重复报同样的内容。"""
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                "SELECT * FROM topics WHERE summary IS NOT NULL AND summary<>'' "
+                "SELECT * FROM topics t WHERE summary IS NOT NULL AND summary<>'' "
+                "AND NOT EXISTS (SELECT 1 FROM used u WHERE u.bvid=t.bvid) "
                 "ORDER BY fetched DESC, published DESC LIMIT ?", (max(1, min(int(limit), 6)),)).fetchall()
             items = [self.export(row) for row in rows]
             for row in rows:
+                db.execute("INSERT INTO used VALUES (?,?,?)", ("manual", row["bvid"], time.time()))
                 db.execute("DELETE FROM topics WHERE bvid=?", (row["bvid"],))
-                db.execute("DELETE FROM used WHERE bvid=?", (row["bvid"],))
         return items
 
     def _migrate_scenes(self) -> None:
@@ -195,6 +203,22 @@ class Store:
         with self.connect() as db:
             row = db.execute("SELECT * FROM transcripts WHERE bvid=?", (bvid,)).fetchone()
         return dict(row) if row else None
+
+    def get_shared_watch(self, bvid, cid, revision):
+        with self.connect() as db:
+            row = db.execute("SELECT evidence FROM shared_watches WHERE bvid=? AND cid=? "
+                             "AND revision=? AND updated_utc>=?",
+                             (bvid, cid, revision, time.time() - 7 * 86400)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_shared_watch(self, bvid, cid, revision, evidence):
+        now = time.time()
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO shared_watches VALUES (?,?,?,?,?)",
+                       (bvid, cid, revision, json.dumps(evidence, ensure_ascii=False), now))
+            db.execute("DELETE FROM shared_watches WHERE updated_utc < ?", (now - 7 * 86400,))
+            db.execute("DELETE FROM shared_watches WHERE rowid IN "
+                       "(SELECT rowid FROM shared_watches ORDER BY updated_utc DESC LIMIT -1 OFFSET 128)")
 
     def save_transcript(self, bvid, cid, model, language, duration, text):
         now = time.time()

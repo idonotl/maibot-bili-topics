@@ -31,6 +31,9 @@ class Transcript:
     model: str
     segments: int
     elapsed: float
+    # Preserve the audio timeline for joint video analysis. Older tools still
+    # use the flat text and segment count.
+    spans: tuple[tuple[float, float, str], ...] = ()
 
 
 def usable(text: str) -> bool:
@@ -86,7 +89,7 @@ async def download_audio(url: str, target: Path) -> int:
     return size
 
 
-def transcribe_file(path: Path, model, language: str = "zh", prompt: str = "") -> Transcript:
+def transcribe_file(path: Path, model, language: str | None = "zh", prompt: str = "") -> Transcript:
     """同步转写（在线程里跑），返回合并后的全文。"""
     started = time.time()
     segments, info = model.transcribe(
@@ -94,16 +97,18 @@ def transcribe_file(path: Path, model, language: str = "zh", prompt: str = "") -
         initial_prompt=prompt or None, condition_on_previous_text=False,
     )
     parts = []
+    spans = []
     count = 0
     for segment in segments:
         text = (segment.text or "").strip()
         if text:
             parts.append(text)
+            spans.append((float(segment.start), float(segment.end), text))
             count += 1
     return Transcript(
-        text="".join(parts), language=getattr(info, "language", language) or language,
+        text="".join(parts), language=getattr(info, "language", language) or language or "",
         duration=float(getattr(info, "duration", 0.0) or 0.0), model=getattr(model, "model_size_or_path", ""),
-        segments=count, elapsed=time.time() - started,
+        segments=count, elapsed=time.time() - started, spans=tuple(spans),
     )
 
 

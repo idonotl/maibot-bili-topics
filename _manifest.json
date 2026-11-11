@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.bili-topics",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "name": "B站话题 · 麦麦适配版",
-  "description": "B站公开话题、弹幕、可选语音转写、关键帧视觉描述与后台深看。",
+  "description": "处理用户分享的 B站视频：先联合理解完整音轨和分段画面，再按人设回应；保留公开搜索、主动浏览与表达学习素材功能。",
   "author": {
     "name": "idonotl",
     "url": "https://github.com/idonotl"
@@ -27,7 +27,9 @@
   "dependencies": [],
   "capabilities": [
     "llm.generate",
-    "api.call"
+    "api.call",
+    "message.get_by_id",
+    "message.get_by_time_in_chat"
   ],
   "i18n": {
     "default_locale": "zh-CN",

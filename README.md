@@ -1,16 +1,16 @@
-# B站话题与视频深看 · MaiBot 插件
+# B站话题与转写 · MaiBot 插件
 
-获取公开话题、搜索、简介和弹幕，并可转写视频语音、抽帧描述画面。
+公开热门、搜索、简介和弹幕素材，以及可选本地 faster-whisper 音频转写。
 
-> 当前预发布版本 0.6.0。验证环境为 MaiBot 1.3.19、SDK 2.21.0。
+> 首次开源预发布，版本 0.7.0。尚未在所有宿主版本及系统实测；不是 DeepSeek 官方插件。
 
 ## 快速开始
 
-1. 安装 MaiBot 与其要求的 Python（建议 3.12）。本插件使用 SDK 2.16.0 及以上的接口；已核对 1.3.19 下的插件测试；实际联网与 QQ 联调需在自己的部署中验收。
+1. 安装 MaiBot 与其要求的 Python（建议 3.12）。本插件使用 SDK 2.16.0 及以上的接口；旧环境验证基线为 MaiBot 1.3.15，新源码 1.3.19 的完整运行兼容尚待验证。
 2. 将本仓库完整克隆到宿主实际的插件目录，确保 `_manifest.json`、`plugin.py` 位于该插件目录根层。Windows、Linux、Docker 要使用各自实际挂载路径，不照抄开发者电脑路径。
 3. 在宿主使用的同一 Python 环境运行 `python -m pip install -r requirements.txt`。已有同版本依赖可复用，不要安装到无关的系统 Python。
 4. 复制 `config.example.toml` 为 `config.toml`，或通过宿主插件配置页生成实际配置。**先填配置，再显式启用**。
-5. 配置授权会话及模型别名。先验证基本查询，再按需开启音轨、画面和后台深看。
+5. 配置授权会话及模型别名。先关闭转写和自动浏览，验证基本查询；如需转写，另行安装 faster-whisper 并配置本地模型目录。
 6. 重启或通过宿主支持的方式重新加载插件，在插件页查看状态和错误。先用隔离测试会话，不要在大群直接测试自动发送。
 
 ```sh
@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 
 ## 使用和限制
 
-配置授权会话及模型别名。先验证基本查询，再按需开启音轨、画面和后台深看。
+配置授权会话及模型别名。先关闭转写和自动浏览，验证基本查询；如需转写，另行安装 faster-whisper 并配置本地模型目录。
 
 运行数据位于 SDK `ctx.paths.data_dir` 指向的独立目录，通常为 `instance/data/plugins/local.bili-topics/`。源码仓库不包含任何用户记忆、好感数据库、账号配置或登录会话。备份使用 SQLite backup API 或宿主提供的备份操作，不只复制仍在写入的主文件而漏掉 WAL。
 
@@ -53,11 +53,12 @@ python -m unittest discover -s tests -v
 
 本插件许可证为 `MIT`，见 [LICENSE](LICENSE)。相关上游声明如有则保留在 NOTICE.md、UPSTREAM-LICENSE。本项目独立适配 MaiBot，不安装或冒充原 DSH 插件；依赖及模型权重适用其各自许可证。
 
-### 视频资料与深看
+### B站资料层级与可选转写
 
-- 基础工具包括 `bili_video_probe`、`bili_search`、`bili_trending`。标题、简介和弹幕分别提供元信息及观众反应。
-- `bili_transcript` 将有权访问的音轨交给本地 faster-whisper。安装 `requirements-transcript.txt` 后提供 CTranslate2 格式的模型目录，设置 `transcript_model_dir` 与 `transcript_enabled=true`。CPU 可使用 `int8`；模型文件单独准备。
-- `bili_frames` 按时长和弹幕热点取样，PyAV 解码，Pillow 压缩，宿主模型生成画面描述。设 `frames_enabled=true`，确认宿主 `utils` 模型能接收图片输入。截图只反映抽样时刻，弹幕不能作为画面事实。
-- `browse_enabled=true` 后可启用 `browse_deep_watch`，后台按开关完成转写与抽帧。同一视频可以复用缓存。表达学习通过可选的 `local.whale-style.auto_learn` 联动；独立安装这个仓库即可使用视频功能。
-- 若匿名无法获取部分媒体轨，可按自己的访问权限使用本地 SDK 数据目录中的 `bili-cookie.json`，结构为 `{"cookies": {"SESSDATA": "<本地值>"}}`。公开版本只将 Cookie 发往 B 站 API 的 HTTPS 请求。切勿提交真实文件。
-- `local.bili-topics.pick_topic` 可供主动搭话使用，`local.bili-topics.learning_material` 可供表达学习取缓存。两者都不会直接发送 QQ 消息。
+基础工具 `bili_video_probe`、`bili_search`、`bili_trending` 获取公开素材。简介、弹幕和自动语音转写是不同资料，弹幕不能当成字幕或证明视频实际说了什么；代码包含音频转写，并非已实现读取所有 B站字幕。没有画面分析能力，不能理解仅在画面出现的操作和图表。
+
+转写需在宿主环境安装 `requirements-transcript.txt`，另行获得兼容 faster-whisper/CTranslate2 的模型目录，并设置 `transcript_model_dir`。代码使用 `local_files_only=True`，不会因为填了模型名字就自动下载。CPU 可用 int8；GPU 为可选项，需要自己配置兼容 CTranslate2 的 CUDA/cuDNN 环境。仓库不含模型权重，也不宣称任意 GPU 配置可用。
+
+转写会下载受限大小的音轨到临时目录，调用本地模型并尝试清理音频；进程被强制退出时要检查临时文件。不要处理无权访问的内容，不绕过付费、登录和验证码。B站接口不是稳定性承诺，限流或接口变化时可能不可用。旧开发笔记中的“免登录可用”不是所有视频都能访问的保证。
+
+需要主动分享时可另装 `maibot-whale-speakup`，填写同一组授权会话。对外 API `local.bili-topics.pick_topic` 是可选话题源，取用不等于已发出消息。
