@@ -15,7 +15,6 @@ import statistics
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import av
 import httpx
 
 HEADERS: Dict[str, str] = {
@@ -239,6 +238,8 @@ def extract(
     declared_duration: Optional[float] = None,
 ) -> List[str]:
     """按时间点抽帧，返回落盘文件名列表。"""
+    # PyAV 只属于本地声画环境；没有安装它时，插件其余功能仍然可用，所以延迟到真正抽帧才导入。
+    import av
     out_dir.mkdir(parents=True, exist_ok=True)
     container = av.open(str(video_path))
     stream = container.streams.video[0]
