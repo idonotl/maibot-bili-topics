@@ -11,12 +11,12 @@ from .store import Store
 from .source import fetch
 from .danmaku import HEADERS, SUMMARY_RPC_TIMEOUT_SECONDS, deep_read, probe, render_probe
 from . import frames as fr
-from .media_watch import FUSION_WAIT_SECONDS
+from .media_watch import ENHANCEMENT_WAIT_SECONDS
 from . import transcript as asr
 from .search import Search, resolve_bvid
 from .watch_chat import SharedWatch
 
-SHARED_WATCH_HOOK_TIMEOUT_MS = (1225 + FUSION_WAIT_SECONDS) * 1000
+SHARED_WATCH_HOOK_TIMEOUT_MS = (1225 + ENHANCEMENT_WAIT_SECONDS) * 1000
 
 
 def asr_duration(seconds) -> str:

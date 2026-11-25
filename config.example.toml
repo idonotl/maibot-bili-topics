@@ -29,6 +29,7 @@ share_watch_webui = false
 share_watch_frames = 24
 share_watch_batch = 6
 share_watch_timeout_seconds = 1200
+share_watch_enhancement_models = []
 browse_enabled = false
 browse_interval_minutes = 240
 browse_daily_max = 3

@@ -33,7 +33,8 @@
 | Settings.share_watch_webui | `bool` | `False` | 允许本地 WebUI 聊天试用声画观看 |
 | Settings.share_watch_frames | `int` | `24` | 分享视频的独立抽帧预算，覆盖首中尾 |
 | Settings.share_watch_batch | `int` | `6` | 分享视频每个分析窗口最多几帧 |
-| Settings.share_watch_timeout_seconds | `int` | `1200` | 下载、转写与分段画面分析的等待上限；剧情汇总单独计时 |
+| Settings.share_watch_timeout_seconds | `int` | `1200` | 下载、转写与分段画面分析的等待上限；剧情与角色增强共用独立时限 |
+| Settings.share_watch_enhancement_models | `list[str]` | `list` | 剧情与角色增强的主备模型配置名。留空时使用摘要任务 |
 | Settings.browse_enabled | `bool` | `False` | 允许她主动去 B站 搜/刷感兴趣的内容当谈资 |
 | Settings.browse_interval_minutes | `int` | `240` | 两次主动浏览的最小间隔（分钟） |
 | Settings.browse_daily_max | `int` | `3` | 每天最多主动浏览几次 |

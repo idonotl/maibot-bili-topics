@@ -26,8 +26,8 @@ HEADERS: Dict[str, str] = {
 }
 
 MAX_SIDE = 1280
-# 视觉描述单次 RPC 上限：宿主硬超时 90 秒，留出协商余量
-FRAME_RPC_TIMEOUT_MS = 380_000
+# 视觉描述单次 RPC 上限：宿主 vlm 硬超时 180 秒，留出协商余量
+FRAME_RPC_TIMEOUT_MS = 400_000
 
 
 def parse_times(xml_bytes: bytes) -> List[float]:
@@ -228,6 +228,13 @@ async def download(client: httpx.AsyncClient, url: str, dest: pathlib.Path) -> N
         with dest.open("wb") as handle:
             async for chunk in response.aiter_bytes(1 << 16):
                 handle.write(chunk)
+
+
+def media_duration(path: pathlib.Path) -> float:
+    """容器声明的时长（秒）。下载或解码被截断时，实际解出的时长会短于它。"""
+    import av
+    with av.open(str(path)) as container:
+        return float(container.duration / 1e6) if container.duration else 0.0
 
 
 def extract(

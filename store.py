@@ -43,6 +43,9 @@ class Store:
               CREATE TABLE IF NOT EXISTS shared_watches(
                 bvid TEXT NOT NULL,cid INTEGER NOT NULL,revision INTEGER NOT NULL,
                 evidence TEXT NOT NULL,updated_utc REAL NOT NULL,PRIMARY KEY(bvid,cid));
+              CREATE TABLE IF NOT EXISTS shared_watches_v2(
+                bvid TEXT NOT NULL,cid INTEGER NOT NULL,revision INTEGER NOT NULL,
+                evidence TEXT NOT NULL,updated_utc REAL NOT NULL,PRIMARY KEY(bvid,cid));
               CREATE TABLE IF NOT EXISTS scenes(bvid TEXT PRIMARY KEY,cid INTEGER DEFAULT 0,duration REAL DEFAULT 0,frames INTEGER DEFAULT 0,text TEXT DEFAULT '',hotspots TEXT DEFAULT '',created_utc REAL NOT NULL,updated_utc REAL NOT NULL);
               CREATE TABLE IF NOT EXISTS transcripts(bvid TEXT PRIMARY KEY,cid INTEGER DEFAULT 0,model TEXT DEFAULT '',language TEXT DEFAULT '',duration REAL DEFAULT 0,text TEXT DEFAULT '',chars INTEGER DEFAULT 0,created_utc REAL NOT NULL,updated_utc REAL NOT NULL);""")
             self._migrate_scenes()
@@ -205,20 +208,50 @@ class Store:
         return dict(row) if row else None
 
     def get_shared_watch(self, bvid, cid, revision):
+        table = "shared_watches" if revision == 1 else "shared_watches_v2"
         with self.connect() as db:
-            row = db.execute("SELECT evidence FROM shared_watches WHERE bvid=? AND cid=? "
+            row = db.execute(f"SELECT evidence FROM {table} WHERE bvid=? AND cid=? "
                              "AND revision=? AND updated_utc>=?",
                              (bvid, cid, revision, time.time() - 7 * 86400)).fetchone()
         return json.loads(row[0]) if row else None
 
     def save_shared_watch(self, bvid, cid, revision, evidence):
+        table = "shared_watches" if revision == 1 else "shared_watches_v2"
         now = time.time()
         with self.connect() as db:
-            db.execute("INSERT OR REPLACE INTO shared_watches VALUES (?,?,?,?,?)",
+            db.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,?,?,?)",
                        (bvid, cid, revision, json.dumps(evidence, ensure_ascii=False), now))
-            db.execute("DELETE FROM shared_watches WHERE updated_utc < ?", (now - 7 * 86400,))
-            db.execute("DELETE FROM shared_watches WHERE rowid IN "
-                       "(SELECT rowid FROM shared_watches ORDER BY updated_utc DESC LIMIT -1 OFFSET 128)")
+            self._prune_shared_watches(db, table, now)
+
+    def _prune_shared_watches(self, db, table, now):
+        db.execute(f"DELETE FROM {table} WHERE updated_utc < ?", (now - 7 * 86400,))
+        db.execute(f"DELETE FROM {table} WHERE rowid IN "
+                   f"(SELECT rowid FROM {table} ORDER BY updated_utc DESC LIMIT -1 OFFSET 128)")
+
+    def promote_shared_watch(self, bvid, cid, revision, previous, evidence):
+        """Claim a legacy watch for enhancement while retaining its original expiry."""
+        now = time.time()
+        with self.connect() as db:
+            result = db.execute(
+                "INSERT OR IGNORE INTO shared_watches_v2 "
+                "SELECT bvid,cid,?,?,updated_utc FROM shared_watches "
+                "WHERE bvid=? AND cid=? AND revision=1 AND evidence=? AND updated_utc>=?",
+                (revision, json.dumps(evidence, ensure_ascii=False), bvid, cid,
+                 json.dumps(previous, ensure_ascii=False), now - 7 * 86400),
+            )
+            self._prune_shared_watches(db, "shared_watches_v2", now)
+            return result.rowcount == 1
+
+    def replace_shared_watch(self, bvid, cid, revision, previous, evidence):
+        """Update enhancements only if the source sections have not been replaced."""
+        table = "shared_watches" if revision == 1 else "shared_watches_v2"
+        with self.connect() as db:
+            result = db.execute(
+                f"UPDATE {table} SET evidence=? WHERE bvid=? AND cid=? AND revision=? AND evidence=?",
+                (json.dumps(evidence, ensure_ascii=False), bvid, cid, revision,
+                 json.dumps(previous, ensure_ascii=False)),
+            )
+            return result.rowcount == 1
 
     def save_transcript(self, bvid, cid, model, language, duration, text):
         now = time.time()
